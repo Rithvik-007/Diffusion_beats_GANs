@@ -19,7 +19,7 @@ class ModelConfig:
     num_res_blocks: int = 2            # Residual blocks per resolution level
     attention_resolutions: Tuple[int, ...] = (32, 16, 8)  # Multi-resolution attention
     head_channels: int = 64            # Fixed head width per ADM spec
-    num_classes: int = 10              # CIFAR-10 classes
+    num_classes: int = 11              # CIFAR-10 (10) + null class (1) for CFG
     dropout: float = 0.0
     use_gradient_checkpointing: bool = True
 
@@ -45,9 +45,9 @@ class ClassifierConfig:
 @dataclass
 class DiffusionConfig:
     """DDPM diffusion process configuration."""
-    timesteps: int = 1000
+    timesteps: int = 200
     schedule: str = "linear"           # "linear" or "cosine"
-    guidance_scale: float = 2.0        # Classifier guidance strength
+    guidance_scale: float = 0.0        # Set to 0.0 first, increase to 1.5-3.0 after verifying
 
 
 @dataclass

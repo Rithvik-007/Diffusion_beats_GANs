@@ -1,10 +1,11 @@
 """
-Sampling Script with Classifier Guidance.
+Sampling Script with optional Classifier Guidance.
 
-Generates images using the trained UNet + classifier guidance.
-Supports both pixel-space and latent-space modes.
+Generates images using the trained UNet. Supports both pixel-space
+and latent-space modes.
 
 Usage:
+    python sample.py --mode latent --guidance_scale 0.0 --num_samples 3
     python sample.py --mode latent --guidance_scale 2.0 --num_samples 10
     python sample.py --mode pixel --guidance_scale 0.0 --num_samples 10
 """
@@ -20,50 +21,35 @@ from diffusers import AutoencoderKL
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.unet import UNet
-from model.lora import inject_lora
 from model.classifier import NoisyClassifier
 from diffusion import GaussianDiffusion
 
 
 def load_latent_model(args, device):
-    """Load UNet with LoRA weights for latent-space generation."""
+    """Load full UNet checkpoint for latent-space generation."""
+    # num_classes=11 to match training (10 CIFAR + 1 null class for CFG)
     model = UNet(
         in_channels=4, out_channels=4,
         base_channels=128, channel_mult=(1, 2, 3, 4),
         num_res_blocks=2, attention_resolutions=(32, 16, 8),
-        head_channels=64, num_classes=10, input_size=32,
+        head_channels=64, num_classes=11, input_size=32,
     ).to(device)
 
-    # Load the EXACT base model weights used during training
-    # (critical: LoRA weights are trained on specific base weights)
-    base_path = os.path.join(args.model_dir, "base_model.pt")
-    if os.path.exists(base_path):
-        model.load_state_dict(torch.load(base_path, map_location=device, weights_only=True))
-        print(f"Loaded base model from {base_path}")
+    # Try checkpoint_final.pt first, then fall back to latest numbered checkpoint
+    final_path = os.path.join(args.model_dir, "checkpoint_final.pt")
+    ckpt_path = None
+
+    if os.path.exists(final_path):
+        ckpt_path = final_path
     else:
-        print(f"WARNING: No base model found at {base_path}!")
-        print("  The model will have random base weights — LoRA weights will not work correctly.")
-        print("  Please retrain with the updated train_latent.py to save base_model.pt")
-
-    # Inject LoRA structure
-    model, _ = inject_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
-
-    # Load LoRA weights — try final first, then fall back to latest checkpoint
-    lora_path = os.path.join(args.model_dir, "lora_weights_final.pt")
-    lora_state = None
-
-    if os.path.exists(lora_path):
-        lora_state = torch.load(lora_path, map_location=device, weights_only=True)
-        print(f"Loaded LoRA weights from {lora_path}")
-    else:
-        # Fall back to latest resume checkpoint
+        # Fall back to latest numbered checkpoint
         ckpts = [f for f in os.listdir(args.model_dir)
-                 if f.startswith("lora_ckpt_") and f.endswith(".pt")]
+                 if f.startswith("checkpoint_") and f.endswith(".pt") and "final" not in f]
         if ckpts:
             steps = []
             for c in ckpts:
                 try:
-                    s = int(c.replace("lora_ckpt_", "").replace(".pt", ""))
+                    s = int(c.replace("checkpoint_", "").replace(".pt", ""))
                     steps.append((s, c))
                 except ValueError:
                     pass
@@ -71,21 +57,18 @@ def load_latent_model(args, device):
                 steps.sort()
                 latest_step, latest_ckpt = steps[-1]
                 ckpt_path = os.path.join(args.model_dir, latest_ckpt)
-                state = torch.load(ckpt_path, map_location=device, weights_only=True)
-                lora_state = state["lora_state"]
-                print(f"Loaded LoRA weights from checkpoint {ckpt_path} (step {latest_step})")
+                print(f"No checkpoint_final.pt found, using latest: {latest_ckpt} (step {latest_step})")
 
-    if lora_state is not None:
-        model_state = model.state_dict()
-        loaded = 0
-        for key, val in lora_state.items():
-            if key in model_state:
-                model_state[key] = val
-                loaded += 1
-        model.load_state_dict(model_state)
-        print(f"  Loaded {loaded} LoRA parameter tensors")
+    if ckpt_path:
+        state = torch.load(ckpt_path, map_location=device, weights_only=True)
+        # Handle both full-checkpoint format and raw state_dict
+        if "model" in state:
+            model.load_state_dict(state["model"])
+        else:
+            model.load_state_dict(state)
+        print(f"Loaded model from {ckpt_path}")
     else:
-        print(f"WARNING: No LoRA weights found, using random init")
+        print(f"WARNING: No checkpoint found in {args.model_dir}, using random init!")
 
     model.eval()
     return model
@@ -102,7 +85,11 @@ def load_pixel_model(args, device):
 
     ckpt_path = os.path.join(args.model_dir, "checkpoint_final.pt")
     if os.path.exists(ckpt_path):
-        model.load_state_dict(torch.load(ckpt_path, map_location=device, weights_only=True))
+        state = torch.load(ckpt_path, map_location=device, weights_only=True)
+        if "model" in state:
+            model.load_state_dict(state["model"])
+        else:
+            model.load_state_dict(state)
         print(f"Loaded pixel checkpoint from {ckpt_path}")
     else:
         print(f"WARNING: No checkpoint found at {ckpt_path}, using random init")
@@ -144,7 +131,7 @@ def decode_latents(latents, vae_model_id, device):
         latents = latents.to(device, dtype=torch.float16) / scale_factor
         images = vae.decode(latents).sample
 
-    # Post-process: [-1, 1] → [0, 1]
+    # Post-process: [-1, 1] -> [0, 1]
     images = (images / 2 + 0.5).clamp(0, 1)
 
     del vae
@@ -154,21 +141,20 @@ def decode_latents(latents, vae_model_id, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate images with classifier guidance")
+    parser = argparse.ArgumentParser(description="Generate images with optional classifier guidance")
     parser.add_argument("--mode", type=str, choices=["latent", "pixel"], default="latent")
     parser.add_argument("--num_samples", type=int, default=10,
                         help="Number of samples per class")
     parser.add_argument("--classes", type=str, default="0,1,2,3,4,5,6,7,8,9",
                         help="Comma-separated class indices")
-    parser.add_argument("--guidance_scale", type=float, default=2.0)
-    parser.add_argument("--timesteps", type=int, default=1000)
+    # Set to 0.0 first to verify base generation, then increase to 1.5-3.0
+    parser.add_argument("--guidance_scale", type=float, default=0.0)
+    parser.add_argument("--timesteps", type=int, default=200)
     parser.add_argument("--schedule", type=str, default="linear")
     parser.add_argument("--model_dir", type=str, default=None,
                         help="Directory with model weights (default: runs/<mode>)")
     parser.add_argument("--classifier_dir", type=str, default="checkpoints")
     parser.add_argument("--output_dir", type=str, default="results")
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--vae_model", type=str, default="stabilityai/sd-vae-ft-mse")
     args = parser.parse_args()
 
@@ -198,10 +184,12 @@ def main():
         model = load_pixel_model(args, device)
         shape_per_sample = (3, 256, 256)
 
-    # Load classifier
+    # Load classifier only if guidance is enabled
     classifier = None
     if args.guidance_scale > 0:
         classifier = load_classifier(args, device)
+    else:
+        print("Classifier guidance disabled. Running base model only.")
 
     # Diffusion process
     diffusion = GaussianDiffusion(schedule_name=args.schedule, timesteps=args.timesteps)
@@ -225,19 +213,16 @@ def main():
 
     # Decode latents if in latent mode
     if args.mode == "latent":
-        print("\nDecoding latents → images...")
+        print("\nDecoding latents -> images...")
         all_images = decode_latents(all_samples, args.vae_model, device)
     else:
-        all_images = (all_samples.clamp(-1, 1) + 1) / 2  # [-1,1] → [0,1]
+        all_images = (all_samples.clamp(-1, 1) + 1) / 2  # [-1,1] -> [0,1]
 
     # Save as image grid
-    grid = vutils.make_grid(all_images, nrow=args.num_samples, padding=2, normalize=False)
     save_path = os.path.join(args.output_dir, f"samples_{args.mode}_guided.png")
-
-    from torchvision.utils import save_image
-    save_image(grid, save_path)
+    vutils.save_image(all_images, save_path, nrow=args.num_samples, padding=2)
     print(f"\nSaved sample grid to {save_path}")
-    print(f"Grid shape: {grid.shape}")
+    print(f"Grid shape: {all_images.shape}")
 
 
 if __name__ == "__main__":

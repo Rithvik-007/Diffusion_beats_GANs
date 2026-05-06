@@ -1,10 +1,10 @@
 """
-Latent-Space LoRA Training Script.
+Latent-Space Full UNet Training Script.
 
-Trains the ADM UNet on 32×32 VAE latents (4-channel) with LoRA adapters.
-Only LoRA weights are trainable (~1.5M params). Uses FP16 AMP + 8-bit Adam.
+Trains the ADM UNet on 32x32 VAE latents (4-channel) with ALL parameters.
+Uses FP16 AMP + 8-bit Adam + gradient checkpointing for VRAM efficiency.
+Includes Classifier-Free Guidance (CFG) dropout during training.
 
-This is the "FAST" evolution for comparison with pixel baseline training.
 Supports --resume to continue from the latest checkpoint.
 
 Usage:
@@ -21,23 +21,22 @@ import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
 from tqdm import tqdm
+import torchvision.utils as vutils
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model.unet import UNet
-from model.lora import inject_lora
 from diffusion import GaussianDiffusion
-from config import ModelConfig, LoRAConfig, DiffusionConfig, TrainConfig
 
 
-def get_optimizer(lora_params, lr, use_8bit):
+def get_optimizer(params, lr, use_8bit):
     """
     Get optimizer with 8-bit Adam fallback.
     """
     if use_8bit:
         try:
             import bitsandbytes as bnb
-            optimizer = bnb.optim.Adam8bit(lora_params, lr=lr)
+            optimizer = bnb.optim.Adam8bit(params, lr=lr)
             print("  Using 8-bit Adam (bitsandbytes)")
             return optimizer
         except ImportError:
@@ -45,25 +44,25 @@ def get_optimizer(lora_params, lr, use_8bit):
         except Exception as e:
             print(f"  WARNING: bitsandbytes error ({e}), falling back to AdamW")
 
-    optimizer = torch.optim.AdamW(lora_params, lr=lr)
+    optimizer = torch.optim.AdamW(params, lr=lr)
     print("  Using standard AdamW")
     return optimizer
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Latent-space LoRA diffusion training")
+    parser = argparse.ArgumentParser(description="Latent-space full UNet diffusion training")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=int, default=16)
     parser.add_argument("--latent_dir", type=str, default="data/latents")
     parser.add_argument("--save_dir", type=str, default="runs/latent")
     parser.add_argument("--schedule", type=str, default="linear")
-    parser.add_argument("--timesteps", type=int, default=1000)
+    parser.add_argument("--timesteps", type=int, default=200)
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--use_8bit_adam", action="store_true", default=True)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
+    parser.add_argument("--p_uncond", type=float, default=0.1,
+                        help="Probability of dropping class label for CFG training")
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--sample_interval", type=int, default=500)
     parser.add_argument("--save_interval", type=int, default=500)
@@ -87,6 +86,7 @@ def main():
                             num_workers=0, pin_memory=True)
 
     # --- Build UNet (latent mode: 4ch in/out, 32x32 input) ---
+    # num_classes=11: 10 CIFAR-10 classes + 1 null class (index 10) for CFG
     model = UNet(
         in_channels=4,
         out_channels=4,
@@ -95,35 +95,22 @@ def main():
         num_res_blocks=2,
         attention_resolutions=(32, 16, 8),
         head_channels=64,
-        num_classes=10,
+        num_classes=11,
         dropout=0.0,
         input_size=32,
         use_gradient_checkpointing=args.gradient_checkpointing,
     ).to(device)
 
-    # --- Save base model weights (BEFORE LoRA injection) ---
-    # This is critical: sample.py needs the exact same base weights
-    # that LoRA was trained on top of. Without this, sampling creates
-    # a new random UNet and the LoRA weights are useless.
-    base_model_path = os.path.join(args.save_dir, "base_model.pt")
-    if not os.path.exists(base_model_path):
-        torch.save(model.state_dict(), base_model_path)
-        size_mb = os.path.getsize(base_model_path) / (1024 * 1024)
-        print(f"  Saved base model weights: {base_model_path} ({size_mb:.1f} MB)")
-    else:
-        # Resume: load the original base model weights
-        model.load_state_dict(torch.load(base_model_path, map_location=device, weights_only=True))
-        print(f"  Loaded base model weights from {base_model_path}")
-
-    # --- Inject LoRA ---
-    print(f"\nInjecting LoRA (rank={args.lora_rank}, alpha={args.lora_alpha})...")
-    model, lora_params = inject_lora(model, rank=args.lora_rank, alpha=args.lora_alpha)
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  Total params:     {total_params:,}")
+    print(f"  Trainable params: {trainable_params:,}")
 
     # --- Diffusion process ---
     diffusion = GaussianDiffusion(schedule_name=args.schedule, timesteps=args.timesteps)
 
-    # --- 8-bit Adam optimizer (LoRA params only) ---
-    optimizer = get_optimizer(lora_params, args.lr, args.use_8bit_adam)
+    # --- 8-bit Adam optimizer (ALL parameters) ---
+    optimizer = get_optimizer(model.parameters(), args.lr, args.use_8bit_adam)
 
     # --- AMP setup ---
     scaler = torch.amp.GradScaler("cuda") if args.use_amp and device.type == "cuda" else None
@@ -139,12 +126,12 @@ def main():
     # --- Resume from checkpoint ---
     if args.resume:
         ckpts = [f for f in os.listdir(args.save_dir)
-                 if f.startswith("lora_ckpt_") and f.endswith(".pt")]
+                 if f.startswith("checkpoint_") and f.endswith(".pt") and "final" not in f]
         if ckpts:
             steps = []
             for c in ckpts:
                 try:
-                    s = int(c.replace("lora_ckpt_", "").replace(".pt", ""))
+                    s = int(c.replace("checkpoint_", "").replace(".pt", ""))
                     steps.append((s, c))
                 except ValueError:
                     pass
@@ -154,12 +141,7 @@ def main():
                 ckpt_path = os.path.join(args.save_dir, latest_ckpt)
                 print(f"  Resuming from {ckpt_path} (step {latest_step})")
                 state = torch.load(ckpt_path, map_location=device, weights_only=True)
-                # Load LoRA weights into model
-                model_state = model.state_dict()
-                for key, val in state["lora_state"].items():
-                    if key in model_state:
-                        model_state[key] = val
-                model.load_state_dict(model_state)
+                model.load_state_dict(state["model"])
                 optimizer.load_state_dict(state["optimizer"])
                 if scaler is not None and "scaler" in state:
                     scaler.load_state_dict(state["scaler"])
@@ -177,12 +159,14 @@ def main():
             print(f"  Loaded {len(speed_log)} existing log entries.")
 
     print(f"\n{'='*60}")
-    print(f"LATENT-LoRA TRAINING")
-    print(f"  Mode: FP16 AMP + {'8-bit Adam' if args.use_8bit_adam else 'AdamW'} + LoRA")
-    print(f"  Input: 32×32×4 VAE latents")
+    print(f"LATENT FULL-UNET TRAINING")
+    print(f"  Mode: FP16 AMP + {'8-bit Adam' if args.use_8bit_adam else 'AdamW'}")
+    print(f"  Input: 32x32x4 VAE latents")
     print(f"  Batch size: {args.batch_size}")
     print(f"  Epochs: {args.epochs} (starting from {start_epoch})")
     print(f"  Global step: {global_step}")
+    print(f"  Timesteps: {args.timesteps}")
+    print(f"  CFG p_uncond: {args.p_uncond}")
     print(f"  Gradient checkpointing: {args.gradient_checkpointing}")
     print(f"{'='*60}\n")
 
@@ -197,6 +181,10 @@ def main():
 
             batch_latents = batch_latents.to(device)
             batch_labels = batch_labels.to(device)
+
+            # --- CFG dropout: randomly replace class labels with null class (10) ---
+            mask = torch.rand(batch_labels.shape[0], device=device) < args.p_uncond
+            batch_labels[mask] = 10  # null class index
 
             # Random timesteps
             t = torch.randint(0, args.timesteps, (batch_latents.shape[0],), device=device)
@@ -235,21 +223,20 @@ def main():
                     speed=f"{step_time:.3f}s/it"
                 )
 
-            # Generate samples
+            # Generate sample images
             if global_step % args.sample_interval == 0:
                 _generate_samples(model, diffusion, device, args, global_step)
 
-            # Save LoRA weights + optimizer state for resume
+            # Save checkpoint (full model state for resume)
             if global_step % args.save_interval == 0:
-                _save_resumable_checkpoint(model, optimizer, scaler, global_step, epoch, speed_log, args.save_dir)
+                _save_checkpoint(model, optimizer, scaler, global_step, epoch, speed_log, args.save_dir)
                 _flush_speed_log(speed_log, args.save_dir)
 
         avg_loss = epoch_loss / max(epoch_steps, 1)
         print(f"  Epoch {epoch+1} avg loss: {avg_loss:.4f}")
 
-    # Save final LoRA weights and logs
-    _save_lora_weights(model, args.save_dir, "final")
-    _save_resumable_checkpoint(model, optimizer, scaler, global_step, args.epochs, speed_log, args.save_dir)
+    # Save final checkpoint and logs
+    _save_checkpoint(model, optimizer, scaler, global_step, args.epochs, speed_log, args.save_dir, tag="final")
 
     _flush_speed_log(speed_log, args.save_dir)
     print(f"\nSpeed log saved.")
@@ -265,28 +252,10 @@ def main():
         print(f"Peak VRAM: {peak_mb:.1f} MB")
 
 
-def _save_lora_weights(model, save_dir, tag):
-    """Save only the LoRA parameters (very small files)."""
-    lora_state = {}
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            lora_state[name] = param.data.cpu()
-
-    save_path = os.path.join(save_dir, f"lora_weights_{tag}.pt")
-    torch.save(lora_state, save_path)
-    size_kb = os.path.getsize(save_path) / 1024
-    print(f"\n  LoRA weights saved: {save_path} ({size_kb:.1f} KB)")
-
-
-def _save_resumable_checkpoint(model, optimizer, scaler, global_step, epoch, speed_log, save_dir):
-    """Save full checkpoint for resume capability."""
-    lora_state = {}
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            lora_state[name] = param.data.cpu()
-
+def _save_checkpoint(model, optimizer, scaler, global_step, epoch, speed_log, save_dir, tag=None):
+    """Save full model checkpoint for resume capability."""
     ckpt = {
-        "lora_state": lora_state,
+        "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "global_step": global_step,
         "epoch": epoch,
@@ -295,9 +264,13 @@ def _save_resumable_checkpoint(model, optimizer, scaler, global_step, epoch, spe
     if scaler is not None:
         ckpt["scaler"] = scaler.state_dict()
 
-    save_path = os.path.join(save_dir, f"lora_ckpt_{global_step}.pt")
+    if tag:
+        save_path = os.path.join(save_dir, f"checkpoint_{tag}.pt")
+    else:
+        save_path = os.path.join(save_dir, f"checkpoint_{global_step}.pt")
     torch.save(ckpt, save_path)
-    print(f"  Resume checkpoint saved: {save_path}")
+    size_mb = os.path.getsize(save_path) / (1024 * 1024)
+    print(f"\n  Checkpoint saved: {save_path} ({size_mb:.1f} MB)")
 
 
 def _flush_speed_log(speed_log, save_dir):
@@ -308,9 +281,11 @@ def _flush_speed_log(speed_log, save_dir):
 
 
 def _generate_samples(model, diffusion, device, args, step):
-    """Generate sample latents for monitoring."""
+    """Generate sample latents, decode via VAE, and save as PNG grid."""
     model.eval()
+
     with torch.no_grad():
+        # Generate one sample per class (classes 0-9, no null class)
         class_labels = torch.arange(10, device=device)
         shape = (10, 4, 32, 32)
 
@@ -318,8 +293,35 @@ def _generate_samples(model, diffusion, device, args, step):
             model, shape, class_labels, device, verbose=False
         )
 
-    save_path = os.path.join(args.save_dir, "samples", f"latent_sample_{step}.pt")
-    torch.save(samples.cpu(), save_path)
+    # Decode latents to images via SD-VAE
+    try:
+        from diffusers import AutoencoderKL
+
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse")
+        vae = vae.to(device, dtype=torch.float16)
+        vae.eval()
+
+        with torch.no_grad():
+            decoded = vae.decode(
+                samples.to(device, dtype=torch.float16) / 0.18215
+            ).sample
+
+        images = (decoded / 2 + 0.5).clamp(0, 1).float().cpu()
+
+        del vae
+        torch.cuda.empty_cache()
+
+        # Save as PNG grid
+        save_path = os.path.join(args.save_dir, "samples", f"step_{step}.png")
+        vutils.save_image(images, save_path, nrow=5, padding=2)
+        print(f"\n  Samples saved: {save_path}")
+
+    except Exception as e:
+        # If VAE fails (e.g., not downloaded yet), save raw latents as fallback
+        print(f"\n  WARNING: VAE decode failed ({e}), saving raw latents")
+        save_path = os.path.join(args.save_dir, "samples", f"latent_sample_{step}.pt")
+        torch.save(samples.cpu(), save_path)
+
     model.train()
 
 
