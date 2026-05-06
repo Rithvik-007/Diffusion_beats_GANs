@@ -12,6 +12,34 @@ A faithful implementation of the **ADM (Ablated Diffusion Model)** architecture 
 
 ---
 
+## Results
+
+### Speed Comparison: 8.8x Faster
+
+| Metric | Pixel Baseline | Latent Full UNet |
+|--------|---------------|-----------------|
+| Input Resolution | 256x256x3 | 32x32x4 |
+| Trainable Params | ~115M (all) | ~115M (all) |
+| Precision | FP32 | FP16 (AMP) |
+| Optimizer | Adam | 8-bit Adam |
+| Avg sec/iter | 4.054s | 0.458s |
+| Final Loss | 0.0485 | 0.1894 |
+| **Speedup** | 1.0x | **8.8x** |
+
+### Training Progress (Latent Samples)
+
+Sample images generated during latent training at steps 500, 1000, 2000, 3000, and 4500 are available in [`runs/latent/samples/`](runs/latent/samples/).
+
+### Comparison Charts
+
+Generated charts are available in [`results/`](results/):
+- `speed_comparison.png` — Bar chart showing 8.8x speedup
+- `loss_curves.png` — Training loss curves for both modes
+- `comparison_table.png` — Full comparison summary table
+- `samples_latent_guided.png` — Final generated sample grid (3 per class)
+
+---
+
 ## Architecture
 
 ```
@@ -36,16 +64,6 @@ CIFAR-10 (32x32) -> Resize 256x256 -> SD-VAE Encoder -> Latents (4x32x32)
 | **Timesteps** | 200 (linear schedule) |
 | **CFG** | 10% unconditional dropout during training |
 
-### Pixel vs Latent Comparison
-
-| | Pixel Baseline | Latent Full UNet |
-|---|---|---|
-| Input | 256x256x3 RGB | 32x32x4 latent |
-| Trainable params | ~115M | ~115M |
-| Precision | FP32 | FP16 AMP |
-| Optimizer | Adam | 8-bit Adam |
-| Speed | ~4 sec/iter | ~0.3 sec/iter |
-
 ---
 
 ## Project Structure
@@ -53,7 +71,7 @@ CIFAR-10 (32x32) -> Resize 256x256 -> SD-VAE Encoder -> Latents (4x32x32)
 ```
 ├── model/
 │   ├── __init__.py           # Package exports
-│   ├── unet.py               # Full ADM-style UNet
+│   ├── unet.py               # Full ADM-style UNet (~115M params)
 │   ├── blocks.py             # BigGAN ResBlock, AdaGN, Up/Downsample
 │   ├── attention.py          # Multi-head self-attention (64ch heads)
 │   ├── classifier.py         # Auxiliary noisy-image classifier
@@ -70,6 +88,9 @@ CIFAR-10 (32x32) -> Resize 256x256 -> SD-VAE Encoder -> Latents (4x32x32)
 ├── train_latent.py           # Evolution: latent-space full UNet training
 ├── sample.py                 # Generate images with optional guidance
 ├── compare.py                # Speed/quality comparison plots
+├── results/                  # Generated comparison charts & sample grids
+├── runs/latent/              # Latent training outputs (speed log, samples)
+├── runs/pixel/               # Pixel training outputs (speed log)
 └── requirements.txt          # Dependencies
 ```
 
@@ -115,7 +136,7 @@ Run these steps **in order**. Each step depends on the previous one.
 
 ### Step 0: VAE Sanity Check (~2 min)
 
-**Do this first!** Verifies the VAE encode/decode pipeline works.
+**Do this first!** Verifies the VAE encode/decode pipeline works before you spend 30 min training.
 
 ```bash
 python sanity_check.py
@@ -142,13 +163,13 @@ data/pixels/train_labels.pt      # (10000,)
 
 ### Step 2: Train Latent UNet (~30 min)
 
-Trains the full UNet on latent space with CFG dropout.
+Trains the full UNet on latent space with CFG dropout. You can interrupt at any time — checkpoints are saved every 500 steps.
 
 ```bash
 python train_latent.py --epochs 50 --batch_size 4
 ```
 
-Supports resume if interrupted:
+Resume if interrupted:
 ```bash
 python train_latent.py --epochs 50 --batch_size 4 --resume
 ```
@@ -165,7 +186,7 @@ First verify base generation works (no guidance):
 python sample.py --mode latent --guidance_scale 0.0 --num_samples 3
 ```
 
-Verify the images are NOT black. If they look reasonable, try with CFG:
+Verify the images are NOT black. If they look reasonable, try with guidance:
 
 ```bash
 python sample.py --mode latent --guidance_scale 2.0 --num_samples 5
@@ -175,7 +196,7 @@ python sample.py --mode latent --guidance_scale 2.0 --num_samples 5
 
 ### Step 4: Train Pixel Baseline (optional, ~30 min)
 
-Only needed for the speed comparison. Intentionally slow.
+Only needed for the speed comparison. Intentionally slow (FP32, 256x256, batch_size=1).
 
 ```bash
 python train_pixel.py --epochs 3 --batch_size 1
@@ -190,9 +211,9 @@ python compare.py
 ```
 
 **Output:**
-- `results/speed_comparison.png`
-- `results/loss_curves.png`
-- `results/comparison_table.png`
+- `results/speed_comparison.png` — Speed bar chart
+- `results/loss_curves.png` — Loss curves overlay
+- `results/comparison_table.png` — Full stats table
 
 ---
 
@@ -223,7 +244,7 @@ python compare.py
 
 ## Classifier-Free Guidance (CFG)
 
-During training, class labels are randomly dropped (replaced with null class 10) with probability `p_uncond=0.1`. This lets the model learn both conditional and unconditional generation.
+During training, class labels are randomly dropped (replaced with null class 10) with probability `p_uncond=0.1`. This trains the model to handle both conditional and unconditional generation.
 
 During sampling, CFG steers generation using the difference between conditional and unconditional predictions:
 ```
@@ -238,9 +259,10 @@ output = unconditional + guidance_scale * (conditional - unconditional)
 
 - **Always run `sanity_check.py` first** — saves you from training 30 min with a broken pipeline
 - **If your PC crashes/overheats**: Use `--resume` to continue from the last checkpoint
-- **Monitor GPU temp**: Keep it below 85°C. Close other GPU-heavy apps.
+- **Monitor GPU temp**: Keep below 85C. Close other GPU-heavy apps
 - **VRAM usage**: Latent training uses ~3-4 GB with AMP + gradient checkpointing
 - **Training is working if**: Loss drops below 0.5 within the first epoch
+- **Checkpoints are ~693MB each** — excluded from git via `.gitignore`
 
 ---
 
