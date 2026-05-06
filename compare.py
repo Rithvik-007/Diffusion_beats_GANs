@@ -1,5 +1,5 @@
 """
-Comparison Script — Pixel vs Latent-LoRA Speed & Quality.
+Comparison Script — Pixel vs Latent Speed & Quality.
 
 Reads speed logs from both training runs and generates presentation-ready
 comparison charts and statistics.
@@ -40,8 +40,8 @@ def plot_speed_comparison(pixel_log, latent_log, output_dir):
     latent_speed = np.mean([e["sec_per_iter"] for e in latent_log]) if latent_log else 0
 
     bars = ax.bar(
-        ["Pixel Baseline\n(256×256, FP32, 70M params)",
-         "Latent + LoRA\n(32×32, FP16, 1.5M params)"],
+        ["Pixel Baseline\n(256×256, FP32, ~115M params)",
+         "Latent Full UNet\n(32×32, FP16, ~115M params)"],
         [pixel_speed, latent_speed],
         color=["#e74c3c", "#2ecc71"],
         edgecolor="white",
@@ -56,7 +56,7 @@ def plot_speed_comparison(pixel_log, latent_log, output_dir):
 
     if pixel_speed > 0 and latent_speed > 0:
         speedup = pixel_speed / latent_speed
-        ax.set_title(f"Training Speed Comparison\n(Latent-LoRA is {speedup:.1f}× faster)",
+        ax.set_title(f"Training Speed Comparison\n(Latent is {speedup:.1f}× faster)",
                      fontsize=16, fontweight="bold")
     else:
         ax.set_title("Training Speed Comparison", fontsize=16, fontweight="bold")
@@ -87,7 +87,7 @@ def plot_loss_curves(pixel_log, latent_log, output_dir):
     if latent_log:
         steps = [e["step"] for e in latent_log]
         losses = [e["loss"] for e in latent_log]
-        ax.plot(steps, losses, color="#2ecc71", label="Latent + LoRA", alpha=0.8, linewidth=2)
+        ax.plot(steps, losses, color="#2ecc71", label="Latent Full UNet", alpha=0.8, linewidth=2)
 
     ax.set_xlabel("Training Step", fontsize=13)
     ax.set_ylabel("Loss (MSE)", fontsize=13)
@@ -115,9 +115,9 @@ def plot_stats_table(pixel_log, latent_log, output_dir):
     ax.axis("off")
 
     table_data = [
-        ["Metric", "Pixel Baseline", "Latent + LoRA"],
+        ["Metric", "Pixel Baseline", "Latent Full UNet"],
         ["Input Resolution", "256×256×3", "32×32×4"],
-        ["Trainable Params", "~70M (all)", "~1.5M (LoRA)"],
+        ["Trainable Params", "~115M (all)", "~115M (all)"],
         ["Precision", "FP32", "FP16 (AMP)"],
         ["Optimizer", "Adam", "8-bit Adam"],
         ["Avg sec/iter", f"{pixel_speed:.3f}s", f"{latent_speed:.3f}s"],
@@ -168,7 +168,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 60)
-    print("PIXEL vs LATENT-LoRA COMPARISON")
+    print("PIXEL vs LATENT FULL-UNET COMPARISON")
     print("=" * 60)
 
     # Load logs
@@ -195,7 +195,7 @@ def main():
     if pixel_speed > 0:
         print(f"  Pixel baseline:  {pixel_speed:.3f} sec/iter")
     if latent_speed > 0:
-        print(f"  Latent + LoRA:   {latent_speed:.3f} sec/iter")
+        print(f"  Latent Full UNet: {latent_speed:.3f} sec/iter")
     if pixel_speed > 0 and latent_speed > 0:
         print(f"  Speedup:         {pixel_speed/latent_speed:.1f}×")
     print(f"\nAll plots saved to {args.output_dir}/")
