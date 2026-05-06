@@ -14,10 +14,12 @@ __pycache__/
 data/
 !data/.gitkeep
 
-# Checkpoints & trained weights (large)
-checkpoints/
-runs/
-results/
+# Checkpoint weights (too large for git, ~693MB each)
+runs/*/checkpoint_*.pt
+runs/*/base_model.pt
+
+# Raw latent tensor samples (not needed, PNGs are saved instead)
+runs/*/samples/*.pt
 
 # Debug scripts
 debug_sample.py
@@ -37,3 +39,6 @@ desktop.ini
 # Documents (personal notes)
 *.pdf
 *.docx
+
+# Sanity check output
+sanity_check.png
